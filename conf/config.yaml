@@ -8,8 +8,8 @@ slurm_id: 00000
 wandb_mode: disabled # [offline, disabled, online]
 wandb_project_name: seflow
 
-train_data: /home/kin/data/av2/h5py/demo/train
-val_data: /home/kin/data/av2/h5py/demo/val
+train_data: /data/pczyl2/SceneFlow/Argoverse2/av2/h5py/sensor/train
+val_data: /data/pczyl2/SceneFlow/Argoverse2/av2/h5py/sensor/val
 
 output: ${model.name}-${slurm_id}
 
