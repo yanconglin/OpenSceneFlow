@@ -1,0 +1,257 @@
+import math
+import numpy as np
+
+import dztimer
+import torch
+import torch.nn as nn
+import pytorch3d.ops as pytorch3d_ops
+import torch.nn.functional as F
+import cuml
+import matplotlib.pyplot as plt
+from assets.cuda.histgram import histgram
+
+from .basic import cal_pose0to1
+
+import warnings
+warnings.filterwarnings('ignore')
+np.set_printoptions(suppress=True)
+
+class ICPFlowpp(nn.Module):
+    def __init__(self, 
+                 point_cloud_range = [-51.2, -51.2, -3, 51.2, 51.2, 3], 
+                 flow_range=[-2.0, -2.0, -0.1, 2.0, 2.0, 0.1],
+                 voxel_size=[0.1, 0.1, 0.1],
+                 topk=3,
+                 **kwargs):
+        super().__init__()
+         
+        self.point_cloud_range = point_cloud_range
+        self.flow_range = flow_range
+        self.voxel_size = voxel_size
+        self.topk = topk
+         
+        self.timer = dztimer.Timing()
+        self.timer.start("Total")
+    
+        eps = 1e-8
+        self.bins_x = nn.Parameter(torch.arange(flow_range[0], flow_range[3] + voxel_size[0] + eps, voxel_size[0]), requires_grad=False)
+        self.bins_y = nn.Parameter(torch.arange(flow_range[1], flow_range[4] + voxel_size[1] + eps, voxel_size[1]), requires_grad=False)
+        self.bins_z = nn.Parameter(torch.arange(flow_range[2], flow_range[5] + voxel_size[2] + eps, voxel_size[2]), requires_grad=False)
+        self.d, self.h, self.w = len(self.bins_z), len(self.bins_y), len(self.bins_x)
+        # https://docs.rapids.ai/api/cuml/stable/api/#cuml.cluster.hdbscan.HDBSCAN
+        self.clusterer = cuml.cluster.hdbscan.HDBSCAN(cluster_selection_method='leaf', min_cluster_size=20, output_type='cupy')
+        # clusterer = hdbscan.HDBSCAN(algorithm='best', alpha=1., approx_min_span_tree=True,
+        #                             gen_min_span_tree=True, leaf_size=100,
+        #                             metric='euclidean', min_cluster_size=min_cluster_size, min_samples=None
+
+    def visualize(self, pc0_np, pc1_np, flow_np, label0_np, png_name=None):
+        fig, ax = plt.subplots(figsize=(24, 24))
+        ax.scatter(pc0_np[:, 0], pc0_np[:, 1], c=label0_np, s=1, label='pc0')
+        ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
+        ax.set_xlim(-51.2, 51.2)
+        ax.set_ylim(-51.2, 51.2)
+        if png_name is None:
+            plt.show()
+        else:
+            plt.savefig(f'{png_name}_pcds.png')
+        plt.close()
+
+        pc01_np = pc0_np + flow_np
+        fig, ax = plt.subplots(figsize=(24, 24))
+        ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='g', s=3, label='pc0')
+        ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
+        ax.set_xlim(-51.2, 51.2)
+        ax.set_ylim(-51.2, 51.2)
+        if png_name is None:
+            plt.show()
+        else:
+            plt.savefig(f'{png_name}_flow.png')
+        plt.close()
+
+    def crop_pcds(self, points, labels):
+        masks = (points[:, 0] <= self.point_cloud_range[3]).float() \
+                    + (points[:, 0] >= self.point_cloud_range[0]).float() \
+                        + (points[:, 1] <= self.point_cloud_range[4]).float() \
+                            + (points[:, 1] >= self.point_cloud_range[1]).float() \
+                                + (points[:, 2] <= self.point_cloud_range[5]).float() \
+                                    + (points[:, 2] >= self.point_cloud_range[2]).float()
+
+        masks = torch.nonzero(masks==6)[:, 0] 
+        points = points[masks]
+        labels = labels[masks] if labels is not None else None
+        return points, labels, masks
+        
+    def nms(self, x, kernel_size=3):
+        x = x[:, None, :, :, :].float()
+        xp = torch.nn.functional.max_pool3d(x, kernel_size=kernel_size, stride=1, padding=(kernel_size-1)//2)
+        mask = (x == xp).float().clamp(min=0.0)
+        xp = x * mask
+        return xp[:, 0, :, :, :]
+
+    def select_topk_offset_per_cluster(self, histgram_t):
+        histgram_t = self.nms(histgram_t)
+        topk_max, topk_argmax = histgram_t.view(len(histgram_t), self.d*self.h*self.w).topk(k=self.topk, dim=1) # [l, k]
+        topk_x, topk_y, topk_z = topk_argmax%self.w, topk_argmax//self.w%self.h, topk_argmax//self.h//self.w%self.d
+        return topk_max, topk_x, topk_y, topk_z 
+
+    def flow_calculation(self, pc0, pc1, offsets, unqs, idxs_inverse):    
+        # sanity check
+        assert len(offsets) == len(idxs_inverse)
+        assert idxs_inverse.min()==0
+        assert idxs_inverse.max()+1== len(unqs)
+
+        # calculate nn for each point, compensated by the topk offsets
+        pc01 = pc0[:, None, :] + offsets # [m, topk, 3]
+        dis_topk, idxs_topk, _ = pytorch3d_ops.knn_points(pc01.view(1, len(pc0)*self.topk, 3), pc1[None], lengths1=None, lengths2=None, K=1, return_nn=False, return_sorted=False) # [1, m, k]
+        dis_topk, idxs_topk = dis_topk[0].view(len(pc0), self.topk), idxs_topk[0].view(len(pc0), self.topk) # [m, k]
+
+        # accumulate errors per cluster at the topk offset positions and pick up the offset that leads to the minimal error per cluster
+        idxs_flatten = idxs_inverse.repeat_interleave(self.topk) * self.topk + torch.arange(0, self.topk, device=offsets.device).repeat(len(pc0)) # row idx: wich cluster a point belongs to; col idx: topk
+        clusters = torch.zeros(size=(len(unqs) * self.topk, ), device=offsets.device) # [l, k]
+        clusters.scatter_add_(dim=0, index=idxs_flatten, src=dis_topk.flatten())
+
+        clusters_min, clusters_argmin = clusters.view(len(unqs), self.topk).min(dim=-1) # [l]
+        # print('cluster min: ', clusters_min.shape, clusters_min.max(), clusters_min.min())
+        # print('cluster argmin: ', clusters_argmin.shape, clusters_argmin.max(), clusters_argmin.min())
+        clusters_argmin_pts = clusters_argmin[idxs_inverse] # [m]
+
+        idxs_topk = torch.gather(idxs_topk, index=clusters_argmin_pts[:, None], dim=1) # [m]
+        idxs_topk = idxs_topk[:, 0]
+        flow = pc1[idxs_topk] - pc0
+        return flow
+
+    def _model_forward(self, points_src_batched, points_dst_batched, labels_src_batched):
+        pc0_points_lst = []
+        pc1_points_lst = []
+        pc0_labels_lst = []
+        # pc1_labels_lst = []
+        flows_valid_lst = []
+        flows_lst = []
+
+        for (points_src_, points_dst_, labels_src_) in zip(points_src_batched, points_dst_batched, labels_src_batched):
+            points_src, labels_src, masks_src = self.crop_pcds(points_src_, labels_src_)
+            points_dst, _, masks_dst = self.crop_pcds(points_dst_, None)
+            flows_ = torch.zeros(points_src_.shape, device=points_src_.device) + float('nan') 
+            self.timer[1][0].start("histogram calculation")
+            with torch.no_grad():
+                unqs, idxs_inverse, counts = torch.unique(labels_src, return_inverse=True, return_counts=True)
+                idxs_inverse = idxs_inverse.to(torch.int32)
+                histgram_t = torch.zeros([len(unqs), self.d, self.h, self.w], dtype=torch.int32).to(points_src.device).contiguous()    
+                histgram.histgram_func(points_src, points_dst, idxs_inverse[:, None], \
+                                        histgram_t, \
+                                         self.flow_range[0], self.flow_range[1], self.flow_range[2], \
+                                             self.flow_range[3]+self.voxel_size[0], self.flow_range[4]+self.voxel_size[1], self.flow_range[5]+self.voxel_size[2], \
+                                                 self.w, self.h, self.d)    
+            self.timer[1][0].stop()
+
+            self.timer[1][1].start("topk selection")
+            topk_max, topk_x, topk_y, topk_z = self.select_topk_offset_per_cluster(histgram_t) # [l, k]
+            # let op: corner case: 1. a cluster may receive zero vote; 2. non-clustered ponts (label==0 in this codebase).
+            mask = torch.logical_or(topk_max ==0,  unqs[:, None]==0) 
+            topk_x[mask] = self.w//2 # set zero offset
+            topk_y[mask] = self.h//2 # set zero offset
+            topk_z[mask] = self.d//2 # set zero offset
+            offsets = torch.stack([ self.bins_x[topk_x], self.bins_y[topk_y], self.bins_z[topk_z] ], dim=2)
+            offsets = offsets[idxs_inverse] # [m, k, 3]
+            self.timer[1][1].stop()
+        
+
+            self.timer[1][2].start("flow calculation")
+            flows = self.flow_calculation(points_src, points_dst, offsets, unqs, idxs_inverse) # [l, k]
+            self.timer[1][2].stop()
+
+            self.timer.print(random_colors=True, bold=True)
+            
+            flows_[masks_src] = flows
+            flows_lst.append(flows_)
+
+            # save *_valid_lst for visualization
+            flows_valid_lst.append(flows)
+            pc0_points_lst.append(points_src)
+            pc1_points_lst.append(points_src)
+            pc0_labels_lst.append(labels_src)
+            # pc1_labels_lst.append(labels_dst)
+
+        model_res = {
+            "flow": flows_lst,
+            "flow_valid_lst": flows_valid_lst,
+            "pc0_points_lst": pc0_points_lst,
+            "pc1_points_lst": pc1_points_lst,
+            "pc0_labels_lst": pc0_labels_lst,
+            # "pc1_labels_lst": pc1_labels_lst,
+        }
+        return model_res
+    
+    
+    def forward(self, batch):
+        """
+        input: using the batch from dataloader, which is a dict
+               Detail: [pc0, pc1, pose0, pose1]
+        output: the predicted flow, pose_flow, and the valid point index of pc0
+        """
+        # print(f'processing sample - scene id {batch["scene_id"]}, timestamp {batch["timestamp"]} ')
+        self.timer[0].start("Data Preprocess")
+        batch_sizes = len(batch["pose0"])
+
+        pose_flows = []
+        transform_pc0s = []
+        label0s = []
+        for batch_id in range(batch_sizes):
+            selected_pc0 = batch["pc0"][batch_id]
+            self.timer[0][0].start("pose")
+            with torch.no_grad():
+                if 'ego_motion' in batch:
+                    pose_0to1 = batch['ego_motion'][batch_id]
+                else:
+                    pose_0to1 = cal_pose0to1(batch["pose0"][batch_id], batch["pose1"][batch_id])
+            self.timer[0][0].stop()
+            
+            self.timer[0][1].start("transform")
+            # transform selected_pc0 to pc1
+            transform_pc0 = selected_pc0 @ pose_0to1[:3, :3].T + pose_0to1[:3, 3]
+            self.timer[0][1].stop()
+
+            pose_flows.append(transform_pc0 - selected_pc0)
+            transform_pc0s.append(transform_pc0)
+            self.timer[0][1].start("transform")
+
+            self.timer[0][2].start("clustering")
+            # clustering is also part of the computing time
+            self.timer[0][3].start("fit")
+            self.clusterer.fit(selected_pc0)
+            self.timer[0][3].stop()
+            self.timer[0][4].start("extract labels")
+            label0 = self.clusterer.labels_
+            self.timer[0][4].stop()
+            self.timer[0][5].start("as tensor")
+            label0 = torch.as_tensor(label0, device=selected_pc0.device)
+            self.timer[0][5].stop()
+            label0s.append(label0)
+            self.timer[0][2].stop()
+
+        pc0s = torch.stack(transform_pc0s, dim=0)
+        pc1s = batch["pc1"]
+
+        label0s = torch.stack(label0s, dim=0)
+        self.timer[0].stop()
+        
+        self.timer[1].start("Model Forward")
+        model_res = self._model_forward(pc0s, pc1s, label0s)
+        self.timer[1].stop()
+        
+
+        # # visualize results (batch_size==1 during val/test)
+        # pc0_np = model_res['pc0_points_lst'][0].clone().cpu().numpy()
+        # pc1_np = model_res['pc1_points_lst'][0].clone().cpu().numpy()
+        # flow_np = model_res['flow_valid_lst'][0].clone().cpu().numpy()
+        # label0_np = model_res['pc0_labels_lst'][0].clone().cpu().numpy()
+        # scene_idx = batch['scene_id']
+        # timestamp = batch['timestamp']
+
+        # self.visualize(pc0_np, pc1_np, flow_np, label0_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
+
+        ret_dict = model_res
+        ret_dict["pose_flow"] = pose_flows
+        
+        return ret_dict
+      

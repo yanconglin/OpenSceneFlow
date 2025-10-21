@@ -51,3 +51,11 @@ try:
 except ImportError as e:
     print("--- WARNING [model]: ICPFlow is not imported, as it requires pytorch3d lib which is not installed.")
     print(f"Detail error message\033[0m: {e}. Just ignore this warning if code runs without these models.")
+
+# following need install extra package:
+# * pip install pytorch3d assets/cuda/histgram
+try:
+    from .icpflowpp import ICPFlowpp
+except ImportError as e:
+    print("--- WARNING [model]: ICPFlow is not imported, as it requires pytorch3d lib which is not installed.")
+    print(f"Detail error message\033[0m: {e}. Just ignore this warning if code runs without these models.")
