@@ -18,7 +18,7 @@ np.set_printoptions(suppress=True)
 
 class ICPFlowpp(nn.Module):
     def __init__(self, 
-                 point_cloud_range = [-51.2, -51.2, -3, 51.2, 51.2, 3], 
+                 point_cloud_range = [-50, -50, -3, 50, 50, 3],  #  point_cloud_range = [-51.2, -51.2, -3, 51.2, 51.2, 3], 
                  flow_range=[-2.0, -2.0, -0.1, 2.0, 2.0, 0.1],
                  voxel_size=[0.1, 0.1, 0.1],
                  topk=3,
@@ -44,9 +44,9 @@ class ICPFlowpp(nn.Module):
         #                             gen_min_span_tree=True, leaf_size=100,
         #                             metric='euclidean', min_cluster_size=min_cluster_size, min_samples=None
 
-    def visualize(self, pc0_np, pc1_np, flow_np, label0_np, png_name=None):
+    def visualize(self, pc0_np, pc1_np, flow_np, flow_gt_np, png_name=None):
         fig, ax = plt.subplots(figsize=(24, 24))
-        ax.scatter(pc0_np[:, 0], pc0_np[:, 1], c=label0_np, s=1, label='pc0')
+        ax.scatter(pc0_np[:, 0], pc0_np[:, 1], c='g', s=1, label='pc0')
         ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
         ax.set_xlim(-51.2, 51.2)
         ax.set_ylim(-51.2, 51.2)
@@ -58,29 +58,39 @@ class ICPFlowpp(nn.Module):
 
         pc01_np = pc0_np + flow_np
         fig, ax = plt.subplots(figsize=(24, 24))
-        ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='g', s=3, label='pc0')
         ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
+        ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='r', s=1, label='pc01')
         ax.set_xlim(-51.2, 51.2)
         ax.set_ylim(-51.2, 51.2)
         if png_name is None:
             plt.show()
         else:
-            plt.savefig(f'{png_name}_flow.png')
+            plt.savefig(f'{png_name}_flow_pd.png')
         plt.close()
 
-    def crop_pcds(self, points, labels):
-        masks = (points[:, 0] <= self.point_cloud_range[3]).float() \
-                    + (points[:, 0] >= self.point_cloud_range[0]).float() \
-                        + (points[:, 1] <= self.point_cloud_range[4]).float() \
-                            + (points[:, 1] >= self.point_cloud_range[1]).float() \
-                                + (points[:, 2] <= self.point_cloud_range[5]).float() \
-                                    + (points[:, 2] >= self.point_cloud_range[2]).float()
+        pc01_gt_np = pc0_np + flow_gt_np
+        fig, ax = plt.subplots(figsize=(24, 24))
+        ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
+        ax.scatter(pc01_gt_np[:, 0], pc01_gt_np[:, 1], c='r', s=1, label='pc01')
+        ax.set_xlim(-51.2, 51.2)
+        ax.set_ylim(-51.2, 51.2)
+        if png_name is None:
+            plt.show()
+        else:
+            plt.savefig(f'{png_name}_flow_gt.png')
+        plt.close()
 
-        masks = torch.nonzero(masks==6)[:, 0] 
-        points = points[masks]
-        labels = labels[masks] if labels is not None else None
-        return points, labels, masks
-        
+    def crop_pcds(self, pc):
+        """
+        Limit the point cloud to the given range.
+        """
+        # mask = (pc[:, 0] >= self.point_cloud_range[0]) & (pc[:, 0] <= self.point_cloud_range[3]) & \
+        #        (pc[:, 1] >= self.point_cloud_range[1]) & (pc[:, 1] <= self.point_cloud_range[4]) & \
+        #        (pc[:, 2] >= self.point_cloud_range[2]) & (pc[:, 2] <= self.point_cloud_range[5])
+        mask = (pc[:, 0] >= self.point_cloud_range[0]) & (pc[:, 0] <= self.point_cloud_range[3]) & \
+               (pc[:, 1] >= self.point_cloud_range[1]) & (pc[:, 1] <= self.point_cloud_range[4]) 
+        return pc[mask], mask
+ 
     def nms(self, x, kernel_size=3):
         x = x[:, None, :, :, :].float()
         xp = torch.nn.functional.max_pool3d(x, kernel_size=kernel_size, stride=1, padding=(kernel_size-1)//2)
@@ -120,67 +130,36 @@ class ICPFlowpp(nn.Module):
         flow = pc1[idxs_topk] - pc0
         return flow
 
-    def _model_forward(self, points_src_batched, points_dst_batched, labels_src_batched):
-        pc0_points_lst = []
-        pc1_points_lst = []
-        pc0_labels_lst = []
-        # pc1_labels_lst = []
-        flows_valid_lst = []
-        flows_lst = []
+    def _model_forward(self, points_src, points_dst, labels_src):
+        self.timer[1][0].start("histogram calculation")
+        with torch.no_grad():
+            unqs, idxs_inverse, counts = torch.unique(labels_src, return_inverse=True, return_counts=True)
+            idxs_inverse = idxs_inverse.to(torch.int32)
+            histgram_t = torch.zeros([len(unqs), self.d, self.h, self.w], dtype=torch.int32).to(points_src.device).contiguous()    
+            histgram.histgram_func(points_src, points_dst, idxs_inverse[:, None], \
+                                    histgram_t, \
+                                     self.flow_range[0], self.flow_range[1], self.flow_range[2], \
+                                         self.flow_range[3]+self.voxel_size[0], self.flow_range[4]+self.voxel_size[1], self.flow_range[5]+self.voxel_size[2], \
+                                             self.w, self.h, self.d)    
+        self.timer[1][0].stop()
 
-        for (points_src_, points_dst_, labels_src_) in zip(points_src_batched, points_dst_batched, labels_src_batched):
-            points_src, labels_src, masks_src = self.crop_pcds(points_src_, labels_src_)
-            points_dst, _, masks_dst = self.crop_pcds(points_dst_, None)
-            flows_ = torch.zeros(points_src_.shape, device=points_src_.device) + float('nan') 
-            self.timer[1][0].start("histogram calculation")
-            with torch.no_grad():
-                unqs, idxs_inverse, counts = torch.unique(labels_src, return_inverse=True, return_counts=True)
-                idxs_inverse = idxs_inverse.to(torch.int32)
-                histgram_t = torch.zeros([len(unqs), self.d, self.h, self.w], dtype=torch.int32).to(points_src.device).contiguous()    
-                histgram.histgram_func(points_src, points_dst, idxs_inverse[:, None], \
-                                        histgram_t, \
-                                         self.flow_range[0], self.flow_range[1], self.flow_range[2], \
-                                             self.flow_range[3]+self.voxel_size[0], self.flow_range[4]+self.voxel_size[1], self.flow_range[5]+self.voxel_size[2], \
-                                                 self.w, self.h, self.d)    
-            self.timer[1][0].stop()
-
-            self.timer[1][1].start("topk selection")
-            topk_max, topk_x, topk_y, topk_z = self.select_topk_offset_per_cluster(histgram_t) # [l, k]
-            # let op: corner case: 1. a cluster may receive zero vote; 2. non-clustered ponts (label==0 in this codebase).
-            mask = torch.logical_or(topk_max ==0,  unqs[:, None]==0) 
-            topk_x[mask] = self.w//2 # set zero offset
-            topk_y[mask] = self.h//2 # set zero offset
-            topk_z[mask] = self.d//2 # set zero offset
-            offsets = torch.stack([ self.bins_x[topk_x], self.bins_y[topk_y], self.bins_z[topk_z] ], dim=2)
-            offsets = offsets[idxs_inverse] # [m, k, 3]
-            self.timer[1][1].stop()
+        self.timer[1][1].start("topk selection")
+        topk_max, topk_x, topk_y, topk_z = self.select_topk_offset_per_cluster(histgram_t) # [l, k]
+        # let op: corner case: 1. a cluster may receive zero vote; 2. non-clustered ponts (label==0 in this codebase).
+        mask = torch.logical_or(topk_max ==0,  unqs[:, None]==0) 
+        topk_x[mask] = self.w//2 # set zero offset
+        topk_y[mask] = self.h//2 # set zero offset
+        topk_z[mask] = self.d//2 # set zero offset
+        offsets = torch.stack([ self.bins_x[topk_x], self.bins_y[topk_y], self.bins_z[topk_z] ], dim=2)
+        offsets = offsets[idxs_inverse] # [m, k, 3]
+        self.timer[1][1].stop()
         
 
-            self.timer[1][2].start("flow calculation")
-            flows = self.flow_calculation(points_src, points_dst, offsets, unqs, idxs_inverse) # [l, k]
-            self.timer[1][2].stop()
-
-            self.timer.print(random_colors=True, bold=True)
-            
-            flows_[masks_src] = flows
-            flows_lst.append(flows_)
-
-            # save *_valid_lst for visualization
-            flows_valid_lst.append(flows)
-            pc0_points_lst.append(points_src)
-            pc1_points_lst.append(points_src)
-            pc0_labels_lst.append(labels_src)
-            # pc1_labels_lst.append(labels_dst)
-
-        model_res = {
-            "flow": flows_lst,
-            "flow_valid_lst": flows_valid_lst,
-            "pc0_points_lst": pc0_points_lst,
-            "pc1_points_lst": pc1_points_lst,
-            "pc0_labels_lst": pc0_labels_lst,
-            # "pc1_labels_lst": pc1_labels_lst,
-        }
-        return model_res
+        self.timer[1][2].start("flow calculation")
+        flows = self.flow_calculation(points_src, points_dst, offsets, unqs, idxs_inverse) # [l, k]
+        self.timer[1][2].stop()
+ 
+        return flows
     
     
     def forward(self, batch):
@@ -190,68 +169,87 @@ class ICPFlowpp(nn.Module):
         output: the predicted flow, pose_flow, and the valid point index of pc0
         """
         # print(f'processing sample - scene id {batch["scene_id"]}, timestamp {batch["timestamp"]} ')
+        print('eval_mask: ', batch['eval_mask'][0].shape)
+        print('eval_mask: ', batch['eval_mask'][0].sum())
         self.timer[0].start("Data Preprocess")
         batch_sizes = len(batch["pose0"])
+        assert batch_sizes==1
 
-        pose_flows = []
-        transform_pc0s = []
-        label0s = []
         for batch_id in range(batch_sizes):
-            selected_pc0 = batch["pc0"][batch_id]
+            pc0_ = batch["pc0"][batch_id]
+            pc1_ = batch["pc0"][batch_id]
+            pc0, mask0 = self.crop_pcds(pc0_)
+            pc1, mask1 = self.crop_pcds(pc1_)
+            print('mask0: ', mask0.shape, mask0.sum())
             self.timer[0][0].start("pose")
             with torch.no_grad():
                 if 'ego_motion' in batch:
                     pose_0to1 = batch['ego_motion'][batch_id]
                 else:
                     pose_0to1 = cal_pose0to1(batch["pose0"][batch_id], batch["pose1"][batch_id])
+
             self.timer[0][0].stop()
             
             self.timer[0][1].start("transform")
             # transform selected_pc0 to pc1
-            transform_pc0 = selected_pc0 @ pose_0to1[:3, :3].T + pose_0to1[:3, 3]
+            transform_pc0 = pc0 @ pose_0to1[:3, :3].T + pose_0to1[:3, 3]
             self.timer[0][1].stop()
 
-            pose_flows.append(transform_pc0 - selected_pc0)
-            transform_pc0s.append(transform_pc0)
             self.timer[0][1].start("transform")
 
             self.timer[0][2].start("clustering")
             # clustering is also part of the computing time
-            self.timer[0][3].start("fit")
-            self.clusterer.fit(selected_pc0)
-            self.timer[0][3].stop()
-            self.timer[0][4].start("extract labels")
+            self.clusterer.fit(transform_pc0)
             label0 = self.clusterer.labels_
-            self.timer[0][4].stop()
-            self.timer[0][5].start("as tensor")
-            label0 = torch.as_tensor(label0, device=selected_pc0.device)
-            self.timer[0][5].stop()
-            label0s.append(label0)
+            label0 = torch.as_tensor(label0, device=transform_pc0.device)
             self.timer[0][2].stop()
 
-        pc0s = torch.stack(transform_pc0s, dim=0)
-        pc1s = batch["pc1"]
-
-        label0s = torch.stack(label0s, dim=0)
-        self.timer[0].stop()
+            self.timer[0].stop()
         
-        self.timer[1].start("Model Forward")
-        model_res = self._model_forward(pc0s, pc1s, label0s)
-        self.timer[1].stop()
+            self.timer[1].start("Model Forward")
+            flow = self._model_forward(transform_pc0, pc1, label0)
+            self.timer[1].stop()
         
+            # self.timer.print(random_colors=True, bold=True)
 
-        # # visualize results (batch_size==1 during val/test)
-        # pc0_np = model_res['pc0_points_lst'][0].clone().cpu().numpy()
-        # pc1_np = model_res['pc1_points_lst'][0].clone().cpu().numpy()
-        # flow_np = model_res['flow_valid_lst'][0].clone().cpu().numpy()
-        # label0_np = model_res['pc0_labels_lst'][0].clone().cpu().numpy()
-        # scene_idx = batch['scene_id']
-        # timestamp = batch['timestamp']
+            # visualize results (batch_size==1 during val/test)
+            transform_pc0_np = transform_pc0.clone().cpu().numpy()
+            pc0_np = pc0.clone().cpu().numpy()
+            pc1_np = pc1.clone().cpu().numpy()
+            flow_np = flow.clone().cpu().numpy()
+            label0_np = label0.clone().cpu().numpy()
 
-        # self.visualize(pc0_np, pc1_np, flow_np, label0_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
+            flow_pose = (transform_pc0 - pc0)
+            flow_pose_np = flow_pose.clone().cpu().numpy()
 
-        ret_dict = model_res
-        ret_dict["pose_flow"] = pose_flows
+            flow_gt = batch['flow'][0]
+            gm0 = batch['gm0'][0]
+            flow_gt = flow_gt[~gm0]
+            flow_gt_np = flow_gt[mask0].clone().cpu().numpy()
+            # flow_gt_np = flow_gt_np - flow_pose_np
+
+            scene_idx = batch['scene_id']
+            timestamp = batch['timestamp']
+            print(type(scene_idx), scene_idx)
+
+            pc01_np2 = transform_pc0_np + flow_gt_np
+            pc01_np = pc0_np + flow_gt_np
+            fig, ax = plt.subplots(figsize=(24, 24))
+            ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
+            ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='g', s=1, label='pc01')
+            ax.scatter(pc01_np2[:, 0], pc01_np2[:, 1], c='r', s=1, label='pc01')
+            ax.set_xlim(-51.2, 51.2)
+            ax.set_ylim(-51.2, 51.2)
+            plt.savefig(f'sanity_check.png')
+            plt.close()
+            exit()
+
+            self.visualize(transform_pc0_np, pc1_np, flow_np, flow_gt_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
+
+            flow_ = torch.zeros((len(pc0_), 3), device=pc0_.device)
+            flow_[mask0] = flow
+        ret_dict = {}
+        ret_dict["flow"] = [flow_]
         
         return ret_dict
       
