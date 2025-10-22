@@ -18,7 +18,7 @@ np.set_printoptions(suppress=True)
 
 class ICPFlowpp(nn.Module):
     def __init__(self, 
-                 point_cloud_range = [-50, -50, -3, 50, 50, 3],  #  point_cloud_range = [-51.2, -51.2, -3, 51.2, 51.2, 3], 
+                 point_cloud_range = [-51.2, -51.2, -3, 51.2, 51.2, 3], 
                  flow_range=[-2.0, -2.0, -0.1, 2.0, 2.0, 0.1],
                  voxel_size=[0.1, 0.1, 0.1],
                  topk=3,
@@ -169,18 +169,16 @@ class ICPFlowpp(nn.Module):
         output: the predicted flow, pose_flow, and the valid point index of pc0
         """
         # print(f'processing sample - scene id {batch["scene_id"]}, timestamp {batch["timestamp"]} ')
-        print('eval_mask: ', batch['eval_mask'][0].shape)
-        print('eval_mask: ', batch['eval_mask'][0].sum())
         self.timer[0].start("Data Preprocess")
         batch_sizes = len(batch["pose0"])
         assert batch_sizes==1
 
         for batch_id in range(batch_sizes):
-            pc0_ = batch["pc0"][batch_id]
-            pc1_ = batch["pc0"][batch_id]
-            pc0, mask0 = self.crop_pcds(pc0_)
-            pc1, mask1 = self.crop_pcds(pc1_)
-            print('mask0: ', mask0.shape, mask0.sum())
+            pc0 = batch["pc0"][batch_id]
+            pc1 = batch["pc1"][batch_id]
+            pc0_selected, mask0 = self.crop_pcds(pc0)
+            pc1_selected, mask1 = self.crop_pcds(pc1)
+
             self.timer[0][0].start("pose")
             with torch.no_grad():
                 if 'ego_motion' in batch:
@@ -192,64 +190,52 @@ class ICPFlowpp(nn.Module):
             
             self.timer[0][1].start("transform")
             # transform selected_pc0 to pc1
-            transform_pc0 = pc0 @ pose_0to1[:3, :3].T + pose_0to1[:3, 3]
+            pc0_transformed = pc0_selected @ pose_0to1[:3, :3].T + pose_0to1[:3, 3]
             self.timer[0][1].stop()
 
             self.timer[0][1].start("transform")
 
             self.timer[0][2].start("clustering")
             # clustering is also part of the computing time
-            self.clusterer.fit(transform_pc0)
+            self.clusterer.fit(pc0_transformed)
             label0 = self.clusterer.labels_
-            label0 = torch.as_tensor(label0, device=transform_pc0.device)
+            label0 = torch.as_tensor(label0, device=pc0_transformed.device)
             self.timer[0][2].stop()
 
             self.timer[0].stop()
         
             self.timer[1].start("Model Forward")
-            flow = self._model_forward(transform_pc0, pc1, label0)
+            flow_selected = self._model_forward(pc0_transformed, pc1, label0)
             self.timer[1].stop()
         
             # self.timer.print(random_colors=True, bold=True)
 
-            # visualize results (batch_size==1 during val/test)
-            transform_pc0_np = transform_pc0.clone().cpu().numpy()
-            pc0_np = pc0.clone().cpu().numpy()
-            pc1_np = pc1.clone().cpu().numpy()
-            flow_np = flow.clone().cpu().numpy()
-            label0_np = label0.clone().cpu().numpy()
+            # # visualize results (batch_size==1 during val/test)
+            # pc0_np = pc0_transformed.clone().cpu().numpy()
+            # pc1_np = pc1_selected.clone().cpu().numpy()
+            # flow_np = flow_selected.clone().cpu().numpy()
+            # label0_np = label0.clone().cpu().numpy()
 
-            flow_pose = (transform_pc0 - pc0)
-            flow_pose_np = flow_pose.clone().cpu().numpy()
+            # flow_pose = (pc0_transformed - pc0_selected)
+            # flow_pose_np = flow_pose.clone().cpu().numpy()
 
-            flow_gt = batch['flow'][0]
-            gm0 = batch['gm0'][0]
-            flow_gt = flow_gt[~gm0]
-            flow_gt_np = flow_gt[mask0].clone().cpu().numpy()
+            # flow_gt = batch['flow'][0]
+            # gm0 = batch['gm0'][0]
+            # flow_gt = flow_gt[~gm0]
+            # flow_gt_np = flow_gt[mask0].clone().cpu().numpy()
             # flow_gt_np = flow_gt_np - flow_pose_np
 
-            scene_idx = batch['scene_id']
-            timestamp = batch['timestamp']
-            print(type(scene_idx), scene_idx)
+            # scene_idx = batch['scene_id']
+            # timestamp = batch['timestamp']
+            # print(type(scene_idx), scene_idx)
 
-            pc01_np2 = transform_pc0_np + flow_gt_np
-            pc01_np = pc0_np + flow_gt_np
-            fig, ax = plt.subplots(figsize=(24, 24))
-            ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
-            ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='g', s=1, label='pc01')
-            ax.scatter(pc01_np2[:, 0], pc01_np2[:, 1], c='r', s=1, label='pc01')
-            ax.set_xlim(-51.2, 51.2)
-            ax.set_ylim(-51.2, 51.2)
-            plt.savefig(f'sanity_check.png')
-            plt.close()
-            exit()
+            # self.visualize(pc0_np, pc1_np, flow_np, flow_gt_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
 
-            self.visualize(transform_pc0_np, pc1_np, flow_np, flow_gt_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
+            flow = torch.zeros((len(pc0), 3), device=pc0.device)
+            flow[mask0] = flow_selected
 
-            flow_ = torch.zeros((len(pc0_), 3), device=pc0_.device)
-            flow_[mask0] = flow
         ret_dict = {}
-        ret_dict["flow"] = [flow_]
+        ret_dict["flow"] = [flow] # same size as original pcd wihtout removing invalid pts
         
         return ret_dict
       
