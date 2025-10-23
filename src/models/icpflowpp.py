@@ -7,6 +7,7 @@ import torch.nn as nn
 import pytorch3d.ops as pytorch3d_ops
 import torch.nn.functional as F
 import cuml
+import hdbscan
 import matplotlib.pyplot as plt
 from assets.cuda.histgram import histgram
 
@@ -19,6 +20,7 @@ np.set_printoptions(suppress=True)
 class ICPFlowpp(nn.Module):
     def __init__(self, 
                  point_cloud_range = [-51.2, -51.2, -3, 51.2, 51.2, 3], 
+                #  point_cloud_range = [-50, -50, -3, 50, 50, 3], 
                  flow_range=[-2.0, -2.0, -0.1, 2.0, 2.0, 0.1],
                  voxel_size=[0.1, 0.1, 0.1],
                  topk=3,
@@ -39,12 +41,14 @@ class ICPFlowpp(nn.Module):
         self.bins_z = nn.Parameter(torch.arange(flow_range[2], flow_range[5] + voxel_size[2] + eps, voxel_size[2]), requires_grad=False)
         self.d, self.h, self.w = len(self.bins_z), len(self.bins_y), len(self.bins_x)
         # https://docs.rapids.ai/api/cuml/stable/api/#cuml.cluster.hdbscan.HDBSCAN
-        self.clusterer = cuml.cluster.hdbscan.HDBSCAN(cluster_selection_method='leaf', min_cluster_size=20, output_type='cupy')
-        # clusterer = hdbscan.HDBSCAN(algorithm='best', alpha=1., approx_min_span_tree=True,
-        #                             gen_min_span_tree=True, leaf_size=100,
-        #                             metric='euclidean', min_cluster_size=min_cluster_size, min_samples=None
+        # self.clusterer = cuml.cluster.hdbscan.HDBSCAN(min_cluster_size=50, output_type='cupy')
+        self.clusterer = hdbscan.HDBSCAN(algorithm='best', alpha=1., approx_min_span_tree=True,
+                                    gen_min_span_tree=True, leaf_size=100,
+                                    metric='euclidean', min_cluster_size=20, min_samples=None)
 
-    def visualize(self, pc0_np, pc1_np, flow_np, flow_gt_np, png_name=None):
+    def visualize(self, pc0_np, pc1_np, label0_np, label1_np, flow_np, flow_gt_np, png_name=None):
+        pc01_np = pc0_np + flow_np
+        pc01_gt_np = pc0_np + flow_gt_np
         fig, ax = plt.subplots(figsize=(24, 24))
         ax.scatter(pc0_np[:, 0], pc0_np[:, 1], c='g', s=1, label='pc0')
         ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
@@ -56,28 +60,41 @@ class ICPFlowpp(nn.Module):
             plt.savefig(f'{png_name}_pcds.png')
         plt.close()
 
-        pc01_np = pc0_np + flow_np
         fig, ax = plt.subplots(figsize=(24, 24))
-        ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
-        ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='r', s=1, label='pc01')
+        ax.scatter(pc0_np[:, 0], pc0_np[:, 1], c=label0_np, s=1, label='pc1')
+        # ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='r', s=1, label='pc01')
         ax.set_xlim(-51.2, 51.2)
         ax.set_ylim(-51.2, 51.2)
         if png_name is None:
             plt.show()
         else:
-            plt.savefig(f'{png_name}_flow_pd.png')
+            plt.savefig(f'{png_name}_pcd0_label.png')
         plt.close()
 
-        pc01_gt_np = pc0_np + flow_gt_np
         fig, ax = plt.subplots(figsize=(24, 24))
-        ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
-        ax.scatter(pc01_gt_np[:, 0], pc01_gt_np[:, 1], c='r', s=1, label='pc01')
+        ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='g', s=1, label='pd')
+        ax.scatter(pc01_gt_np[:, 0], pc01_gt_np[:, 1], c='b', s=1, label='gt')
         ax.set_xlim(-51.2, 51.2)
         ax.set_ylim(-51.2, 51.2)
         if png_name is None:
             plt.show()
         else:
-            plt.savefig(f'{png_name}_flow_gt.png')
+            plt.savefig(f'{png_name}_gt_pd.png')
+        plt.close()
+
+        error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
+        error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
+        mask = error >0.5
+        fig, ax = plt.subplots(figsize=(24, 24))
+        ax.scatter(pc0_np[:, 0], pc0_np[:, 1], c='g', s=1, label='pc0')
+        ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='b', s=1, label='pd')
+        ax.scatter(pc01_np[mask, 0], pc01_np[mask, 1], c='r', s=1, label='error')
+        ax.set_xlim(-51.2, 51.2)
+        ax.set_ylim(-51.2, 51.2)
+        if png_name is None:
+            plt.show()
+        else:
+            plt.savefig(f'{png_name}_error.png')
         plt.close()
 
     def crop_pcds(self, pc):
@@ -196,25 +213,26 @@ class ICPFlowpp(nn.Module):
             self.timer[0][1].start("transform")
 
             self.timer[0][2].start("clustering")
-            # clustering is also part of the computing time
-            self.clusterer.fit(pc0_transformed)
-            label0 = self.clusterer.labels_
+            pc0_transformed_np = pc0_transformed.clone().cpu().numpy()
+            self.clusterer.fit(pc0_transformed_np)
+            label0 = self.clusterer.labels_ + 1
             label0 = torch.as_tensor(label0, device=pc0_transformed.device)
             self.timer[0][2].stop()
 
             self.timer[0].stop()
         
             self.timer[1].start("Model Forward")
-            flow_selected = self._model_forward(pc0_transformed, pc1, label0)
+            flow_selected = self._model_forward(pc0_transformed, pc1_selected, label0)
             self.timer[1].stop()
         
             # self.timer.print(random_colors=True, bold=True)
 
-            # # visualize results (batch_size==1 during val/test)
+            # # # # visualize results (batch_size==1 during val/test)
             # pc0_np = pc0_transformed.clone().cpu().numpy()
             # pc1_np = pc1_selected.clone().cpu().numpy()
-            # flow_np = flow_selected.clone().cpu().numpy()
             # label0_np = label0.clone().cpu().numpy()
+            # label1_np = None
+            # flow_np = flow_selected.clone().cpu().numpy()
 
             # flow_pose = (pc0_transformed - pc0_selected)
             # flow_pose_np = flow_pose.clone().cpu().numpy()
@@ -228,8 +246,8 @@ class ICPFlowpp(nn.Module):
             # scene_idx = batch['scene_id']
             # timestamp = batch['timestamp']
             # print(type(scene_idx), scene_idx)
-
-            # self.visualize(pc0_np, pc1_np, flow_np, flow_gt_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
+            # # error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
+            # self.visualize(pc0_np, pc1_np, label0_np, label1_np, flow_np, flow_gt_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
 
             flow = torch.zeros((len(pc0), 3), device=pc0.device)
             flow[mask0] = flow_selected
