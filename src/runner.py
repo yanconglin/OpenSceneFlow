@@ -267,11 +267,11 @@ def _run_process(cfg, mode):
                     final_metrics.epe_3way[key].extend(val_list)
 
                 for class_idx, class_name in enumerate(metrics_obj.bucketedMatrix.class_names):
-                    for speed_idx, speed_bucket in enumerate(metrics_obj.bucketedMatrix.speed_buckets):
+                    for speed_idx, speed_bucket in enumerate(metrics_obj.bucketedMatrix.range_buckets):
                         count = metrics_obj.bucketedMatrix.count_storage_matrix[class_idx, speed_idx]
                         if count > 0:
                             avg_epe = metrics_obj.bucketedMatrix.epe_storage_matrix[class_idx, speed_idx]
-                            avg_speed = metrics_obj.bucketedMatrix.speed_storage_matrix[class_idx, speed_idx]
+                            avg_speed = metrics_obj.bucketedMatrix.range_storage_matrix[class_idx, speed_idx]
                             final_metrics.bucketedMatrix.accumulate_value(
                                 class_name, speed_bucket, avg_epe, avg_speed, count
                             )
