@@ -21,7 +21,7 @@ class ICPFlowpp(nn.Module):
     def __init__(self, 
                  point_cloud_range = [-51.2, -51.2, -3, 51.2, 51.2, 3], 
                 #  point_cloud_range = [-50, -50, -3, 50, 50, 3], 
-                 flow_range=[-2.0, -2.0, -0.1, 2.0, 2.0, 0.1],
+                 flow_range=[-2.0, -2.0, -0.2, 2.0, 2.0, 0.2],
                  voxel_size=[0.1, 0.1, 0.1],
                  topk=3,
                  **kwargs):
@@ -36,9 +36,9 @@ class ICPFlowpp(nn.Module):
         self.timer.start("Total")
     
         eps = 1e-8
-        self.bins_x = nn.Parameter(torch.arange(flow_range[0], flow_range[3] + voxel_size[0] + eps, voxel_size[0]), requires_grad=False)
-        self.bins_y = nn.Parameter(torch.arange(flow_range[1], flow_range[4] + voxel_size[1] + eps, voxel_size[1]), requires_grad=False)
-        self.bins_z = nn.Parameter(torch.arange(flow_range[2], flow_range[5] + voxel_size[2] + eps, voxel_size[2]), requires_grad=False)
+        self.bins_x = nn.Parameter(torch.arange(flow_range[0], flow_range[3] + eps, voxel_size[0]), requires_grad=False)
+        self.bins_y = nn.Parameter(torch.arange(flow_range[1], flow_range[4] + eps, voxel_size[1]), requires_grad=False)
+        self.bins_z = nn.Parameter(torch.arange(flow_range[2], flow_range[5] + eps, voxel_size[2]), requires_grad=False)
         self.d, self.h, self.w = len(self.bins_z), len(self.bins_y), len(self.bins_x)
         # https://docs.rapids.ai/api/cuml/stable/api/#cuml.cluster.hdbscan.HDBSCAN
         # self.clusterer = cuml.cluster.hdbscan.HDBSCAN(min_cluster_size=50, output_type='cupy')
@@ -101,13 +101,34 @@ class ICPFlowpp(nn.Module):
         """
         Limit the point cloud to the given range.
         """
-        # mask = (pc[:, 0] >= self.point_cloud_range[0]) & (pc[:, 0] <= self.point_cloud_range[3]) & \
-        #        (pc[:, 1] >= self.point_cloud_range[1]) & (pc[:, 1] <= self.point_cloud_range[4]) & \
-        #        (pc[:, 2] >= self.point_cloud_range[2]) & (pc[:, 2] <= self.point_cloud_range[5])
         mask = (pc[:, 0] >= self.point_cloud_range[0]) & (pc[:, 0] <= self.point_cloud_range[3]) & \
-               (pc[:, 1] >= self.point_cloud_range[1]) & (pc[:, 1] <= self.point_cloud_range[4]) 
+               (pc[:, 1] >= self.point_cloud_range[1]) & (pc[:, 1] <= self.point_cloud_range[4]) & \
+               (pc[:, 2] >= self.point_cloud_range[2]) & (pc[:, 2] <= self.point_cloud_range[5])
+        # mask = (pc[:, 0] >= self.point_cloud_range[0]) & (pc[:, 0] <= self.point_cloud_range[3]) & \
+        #        (pc[:, 1] >= self.point_cloud_range[1]) & (pc[:, 1] <= self.point_cloud_range[4]) 
         return pc[mask], mask
  
+    def downsample(self, pc):
+        # crop the pcds and then downsample
+        voxels = pc.clone()
+        voxels[:, 0] -= self.point_cloud_range[0]
+        voxels[:, 1] -= self.point_cloud_range[1]
+        voxels[:, 2] -= self.point_cloud_range[2]
+
+        voxels[:, 0] /= self.voxel_size[0]
+        voxels[:, 1] /= self.voxel_size[1]
+        voxels[:, 2] /= self.voxel_size[2]
+        voxels = voxels.to(torch.int64)
+        voxel_coords, idxs, counts = voxels.unique(return_inverse=True, return_counts=True, dim=0)
+        l = len(voxel_coords)
+        voxels_mean = torch.zeros((l, 3), device=voxels.device)
+        voxels_mean[:, 0].scatter_add_(dim=0, index=idxs, src=pc[:, 0])
+        voxels_mean[:, 1].scatter_add_(dim=0, index=idxs, src=pc[:, 1])
+        voxels_mean[:, 2].scatter_add_(dim=0, index=idxs, src=pc[:, 2])
+        voxels_mean /= counts[:, None]
+        # print('downsample: ', pc.shape, voxels_mean.shape)
+        return voxels_mean
+
     def nms(self, x, kernel_size=3):
         x = x[:, None, :, :, :].float()
         xp = torch.nn.functional.max_pool3d(x, kernel_size=kernel_size, stride=1, padding=(kernel_size-1)//2)
@@ -150,10 +171,14 @@ class ICPFlowpp(nn.Module):
     def _model_forward(self, points_src, points_dst, labels_src):
         self.timer[1][0].start("histogram calculation")
         with torch.no_grad():
+
             unqs, idxs_inverse, counts = torch.unique(labels_src, return_inverse=True, return_counts=True)
             idxs_inverse = idxs_inverse.to(torch.int32)
+
+            points_dst_ = self.downsample(points_dst)
+
             histgram_t = torch.zeros([len(unqs), self.d, self.h, self.w], dtype=torch.int32).to(points_src.device).contiguous()    
-            histgram.histgram_func(points_src, points_dst, idxs_inverse[:, None], \
+            histgram.histgram_func(points_src, points_dst_, idxs_inverse[:, None], \
                                     histgram_t, \
                                      self.flow_range[0], self.flow_range[1], self.flow_range[2], \
                                          self.flow_range[3]+self.voxel_size[0], self.flow_range[4]+self.voxel_size[1], self.flow_range[5]+self.voxel_size[2], \
@@ -227,7 +252,7 @@ class ICPFlowpp(nn.Module):
         
             # self.timer.print(random_colors=True, bold=True)
 
-            # # # # visualize results (batch_size==1 during val/test)
+            # # # # # visualize results (batch_size==1 during val/test)
             # pc0_np = pc0_transformed.clone().cpu().numpy()
             # pc1_np = pc1_selected.clone().cpu().numpy()
             # label0_np = label0.clone().cpu().numpy()
@@ -248,6 +273,7 @@ class ICPFlowpp(nn.Module):
             # print(type(scene_idx), scene_idx)
             # # error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
             # self.visualize(pc0_np, pc1_np, label0_np, label1_np, flow_np, flow_gt_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
+            # exit()
 
             flow = torch.zeros((len(pc0), 3), device=pc0.device)
             flow[mask0] = flow_selected
