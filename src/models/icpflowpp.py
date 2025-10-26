@@ -72,15 +72,27 @@ class ICPFlowpp(nn.Module):
         plt.close()
 
         fig, ax = plt.subplots(figsize=(24, 24))
-        ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='g', s=1, label='pd')
-        ax.scatter(pc01_gt_np[:, 0], pc01_gt_np[:, 1], c='b', s=1, label='gt')
+        # for i in range(len(flow_np)):
+        for i in np.random.randint(0, len(flow_np), size=(10000,)):
+            ax.arrow(pc0_np[i, 0], pc0_np[i, 1], flow_np[i, 0], flow_np[i, 1], head_width=0.2, head_length=0.2, fc='red', ec='b')
+            ax.scatter(pc0_np[i, 0], pc0_np[i, 1], c='g', s=0.1, label='pc01')
+        # ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='b', s=1, label='pc1')
         ax.set_xlim(-51.2, 51.2)
         ax.set_ylim(-51.2, 51.2)
-        if png_name is None:
-            plt.show()
-        else:
-            plt.savefig(f'{png_name}_gt_pd.png')
+        plt.savefig(f'{png_name}_flow.png')
+        # plt.show()
         plt.close()
+
+        # fig, ax = plt.subplots(figsize=(24, 24))
+        # ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='g', s=1, label='pd')
+        # ax.scatter(pc01_gt_np[:, 0], pc01_gt_np[:, 1], c='b', s=1, label='gt')
+        # ax.set_xlim(-51.2, 51.2)
+        # ax.set_ylim(-51.2, 51.2)
+        # if png_name is None:
+        #     plt.show()
+        # else:
+        #     plt.savefig(f'{png_name}_gt_pd.png')
+        # plt.close()
 
         error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
         error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
@@ -273,7 +285,6 @@ class ICPFlowpp(nn.Module):
             # print(type(scene_idx), scene_idx)
             # # error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
             # self.visualize(pc0_np, pc1_np, label0_np, label1_np, flow_np, flow_gt_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
-            # exit()
 
             flow = torch.zeros((len(pc0), 3), device=pc0.device)
             flow[mask0] = flow_selected

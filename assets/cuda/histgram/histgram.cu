@@ -108,7 +108,8 @@ __global__ void NmDistanceKernel(
                 int p_y = __float2int_rd( (offset_y-min_y) / (max_y-min_y) * __int2float_rd(window_y) );
                 int p_z = __float2int_rd( (offset_z-min_z) / (max_z-min_z) * __int2float_rd(window_z) );
 
-	            histgram_translation[hist_idx*window_z*window_y*window_x+ p_z*window_y*window_x+p_y*window_x+p_x] += 1; 
+	            // histgram_translation[hist_idx*window_z*window_y*window_x+ p_z*window_y*window_x+p_y*window_x+p_x] += 1; 
+                atomicAdd(histgram_translation + hist_idx*window_z*window_y*window_x+ p_z*window_y*window_x+p_y*window_x+p_x, 1);
                 // printf("argmin: \
                 //     tid=%06d, \
                 //     i=%06d, j=%06d, \
