@@ -71,28 +71,29 @@ class ICPFlowpp(nn.Module):
             plt.savefig(f'{png_name}_pcd0_label.png')
         plt.close()
 
-        fig, ax = plt.subplots(figsize=(24, 24))
-        # for i in range(len(flow_np)):
-        for i in np.random.randint(0, len(flow_np), size=(10000,)):
-            ax.arrow(pc0_np[i, 0], pc0_np[i, 1], flow_np[i, 0], flow_np[i, 1], head_width=0.2, head_length=0.2, fc='red', ec='b')
-            ax.scatter(pc0_np[i, 0], pc0_np[i, 1], c='g', s=0.1, label='pc01')
-        # ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='b', s=1, label='pc1')
-        ax.set_xlim(-51.2, 51.2)
-        ax.set_ylim(-51.2, 51.2)
-        plt.savefig(f'{png_name}_flow.png')
-        # plt.show()
-        plt.close()
-
         # fig, ax = plt.subplots(figsize=(24, 24))
-        # ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='g', s=1, label='pd')
-        # ax.scatter(pc01_gt_np[:, 0], pc01_gt_np[:, 1], c='b', s=1, label='gt')
+        # # for i in range(len(flow_np)):
+        # for i in np.random.randint(0, len(flow_np), size=(10000,)):
+        #     ax.arrow(pc0_np[i, 0], pc0_np[i, 1], flow_np[i, 0], flow_np[i, 1], head_width=0.2, head_length=0.2, fc='red', ec='b')
+        #     ax.scatter(pc0_np[i, 0], pc0_np[i, 1], c='g', s=0.2, label='pc01')
+        # # ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='b', s=1, label='pc1')
         # ax.set_xlim(-51.2, 51.2)
         # ax.set_ylim(-51.2, 51.2)
-        # if png_name is None:
-        #     plt.show()
-        # else:
-        #     plt.savefig(f'{png_name}_gt_pd.png')
+        # plt.savefig(f'{png_name}_flow.png')
+        # # plt.show()
         # plt.close()
+
+        fig, ax = plt.subplots(figsize=(24, 24))
+        ax.scatter(pc1_np[:, 0], pc1_np[:, 1], c='b', s=1, label='pc1')
+        ax.scatter(pc01_np[:, 0], pc01_np[:, 1], c='r', s=1, label='prediction')
+        # ax.scatter(pc01_gt_np[:, 0], pc01_gt_np[:, 1], c='b', s=1, label='gt')
+        ax.set_xlim(-51.2, 51.2)
+        ax.set_ylim(-51.2, 51.2)
+        if png_name is None:
+            plt.show()
+        else:
+            plt.savefig(f'{png_name}_pd.png')
+        plt.close()
 
         error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
         error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
@@ -175,10 +176,11 @@ class ICPFlowpp(nn.Module):
         # print('cluster argmin: ', clusters_argmin.shape, clusters_argmin.max(), clusters_argmin.min())
         clusters_argmin_pts = clusters_argmin[idxs_inverse] # [m]
 
-        idxs_topk = torch.gather(idxs_topk, index=clusters_argmin_pts[:, None], dim=1) # [m]
-        idxs_topk = idxs_topk[:, 0]
-        flow = pc1[idxs_topk] - pc0
-        return flow
+        offsets_x = torch.gather(offsets[:, :, 0], index=clusters_argmin_pts[:, None], dim=1) # [m, 1]
+        offsets_y = torch.gather(offsets[:, :, 1], index=clusters_argmin_pts[:, None], dim=1) # [m, 1]
+        offsets_z = torch.gather(offsets[:, :, 2], index=clusters_argmin_pts[:, None], dim=1) # [m, 1]
+        offsets_min = torch.cat([offsets_x, offsets_y, offsets_z], dim=1) 
+        return offsets_min
 
     def _model_forward(self, points_src, points_dst, labels_src):
         self.timer[1][0].start("histogram calculation")
@@ -190,20 +192,24 @@ class ICPFlowpp(nn.Module):
             points_dst_ = self.downsample(points_dst)
 
             histgram_t = torch.zeros([len(unqs), self.d, self.h, self.w], dtype=torch.int32).to(points_src.device).contiguous()    
-            histgram.histgram_func(points_src, points_dst_, idxs_inverse[:, None], \
+            histgram.histgram_func(points_src, points_dst_, idxs_inverse, \
                                     histgram_t, \
                                      self.flow_range[0], self.flow_range[1], self.flow_range[2], \
-                                         self.flow_range[3]+self.voxel_size[0], self.flow_range[4]+self.voxel_size[1], self.flow_range[5]+self.voxel_size[2], \
+                                         self.flow_range[3], self.flow_range[4], self.flow_range[5], \
                                              self.w, self.h, self.d)    
         self.timer[1][0].stop()
 
         self.timer[1][1].start("topk selection")
         topk_max, topk_x, topk_y, topk_z = self.select_topk_offset_per_cluster(histgram_t) # [l, k]
-        # let op: corner case: 1. a cluster may receive zero vote; 2. non-clustered ponts (label==0 in this codebase).
-        mask = torch.logical_or(topk_max ==0,  unqs[:, None]==0) 
-        topk_x[mask] = self.w//2 # set zero offset
-        topk_y[mask] = self.h//2 # set zero offset
-        topk_z[mask] = self.d//2 # set zero offset
+        topk_ratio = topk_max/counts[:, None]
+
+        # let op: corner case: 1. a cluster may receive few votes or proportionally a low ratio; 2. non-clustered ponts (label==0 in this codebase).
+        invalid = torch.logical_or(topk_max<10,  topk_ratio<0.1)
+        invalid[0, :] = True
+        topk_x[invalid] = self.w//2 # set zero offset
+        topk_y[invalid] = self.h//2 # set zero offset
+        topk_z[invalid] = self.d//2 # set zero offset
+
         offsets = torch.stack([ self.bins_x[topk_x], self.bins_y[topk_y], self.bins_z[topk_z] ], dim=2)
         offsets = offsets[idxs_inverse] # [m, k, 3]
         self.timer[1][1].stop()
@@ -263,7 +269,6 @@ class ICPFlowpp(nn.Module):
             self.timer[1].stop()
         
             # self.timer.print(random_colors=True, bold=True)
-
             # # # # # visualize results (batch_size==1 during val/test)
             # pc0_np = pc0_transformed.clone().cpu().numpy()
             # pc1_np = pc1_selected.clone().cpu().numpy()
@@ -285,6 +290,7 @@ class ICPFlowpp(nn.Module):
             # print(type(scene_idx), scene_idx)
             # # error = np.linalg.norm(flow_gt_np - flow_np, axis=1)
             # self.visualize(pc0_np, pc1_np, label0_np, label1_np, flow_np, flow_gt_np, png_name= f'visualizations/{scene_idx}_{timestamp}')
+            # # exit()
 
             flow = torch.zeros((len(pc0), 3), device=pc0.device)
             flow[mask0] = flow_selected
